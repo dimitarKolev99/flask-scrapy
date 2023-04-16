@@ -29,6 +29,14 @@ crochet.setup()     # initialize crochet
 
 app = Flask(__name__)
 
+crawl_runner = CrawlerRunner()      # requires the Twisted reactor to run
+quotes_list = []                    # store quotes
+title_list = []
+scrape_in_progress = False
+scrape_complete = False
+table_name = None
+column_definitions = None
+html_string = None
 
 @app.route('/log')
 def log():
@@ -48,20 +56,6 @@ logging.basicConfig(
 def wait_random():
     wait_time = random.uniform(5, 10)
     time.sleep(wait_time)
-
-
-Base = declarative_base()
-
-
-class DynamicModel(Base):
-    __tablename__ = "dynamic_table"
-
-    id = Column(Integer, primary_key=True)
-
-    def __init__(self, **kwargs):
-        for col in self.__table__.columns:
-            if col.name in kwargs:
-                setattr(self, col.name, kwargs[col.name])
 
 
 class MySpider(scrapy.Spider):
@@ -87,21 +81,26 @@ class MySpider(scrapy.Spider):
         try:
             parsed_data = {}
             global title_list
-            for key, selector in self.parsing_logic.items():
-                extracted_data = response.css(selector).get()
-                self.log.debug(f"Extracted {key}: {extracted_data}")
-                parsed_data[key] = extracted_data
-                title_list.append(parsed_data)
-                print("Selector: ", selector)
-                print("Parsed data: ", parsed_data)
-            yield parsed_data
-            print("List: ", title_list)
+            if self.parsing_logic is not None:
+                for key, selector in self.parsing_logic.items():
+                    extracted_data = response.css(selector).get()
+
+                    self.log.debug(f"Extracted {key}: {extracted_data}")
+
+                    parsed_data[key] = extracted_data
+                    title_list.append(parsed_data)
+
+                yield parsed_data
+            else:
+                global html_string
+                html_string = response.text
+                return
         except Exception as e:
             self.log.error("Error parsing response: %s", e)
             raise CloseSpider(f"Error parsing response: {e}")
 
         next_page = None
-        if "next_button" in self.next_button and self.page_count <= int(self.max_pages):
+        if self.next_button is not None and "next_button" in self.next_button and self.page_count <= int(self.max_pages):
             next_page = response.css(
                 self.next_button.get("next_button")).get()
 
@@ -112,14 +111,24 @@ class MySpider(scrapy.Spider):
             wait_random()
             yield scrapy.Request(next_page, callback=self.parse)
 
+@app.route('/html', methods=['POST'])
+def get_html():
+    global html_string
+    global scrape_in_progress
+    global scrape_complete
 
-crawl_runner = CrawlerRunner()      # requires the Twisted reactor to run
-quotes_list = []                    # store quotes
-title_list = []
-scrape_in_progress = False
-scrape_complete = False
-table_name = None
-column_definitions = None
+    req_data = request.get_json()
+    url = req_data['url']
+
+    if not scrape_in_progress:
+        scrape_in_progress = True
+        # start the crawler and execute a callback when complete
+        scrape_with_crochet(
+            url=url, parsing_logic=None, max_pages=None, next_button=None)
+        return 'SCRAPING'
+
+    return 'SCRAPE IN PROGRESS'
+
 
 
 @app.route('/crawl', methods=['POST'])
@@ -147,7 +156,6 @@ def crawl_for_quotes():
 
     if not scrape_in_progress:
         scrape_in_progress = True
-        global quotes_list
         # start the crawler and execute a callback when complete
         scrape_with_crochet(
             url=url, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
@@ -175,68 +183,21 @@ def finished_scrape(results):
     global table_name
     global column_definitions
     global title_list
+    global html_string
 
     a = {
         "data": title_list
     }
 
+    b = {
+        "data": html_string
+    }
+
     if title_list:
         send_webhook(a)
-    # # Connect to the PostgreSQL database
-    # engine = create_engine('postgresql://postgres:postgres@localhost:5433/postgres')
-    # Session = sessionmaker(bind=engine)
-    # session = Session()
-
-    # print("RESULTS IN CALLBACK: ", results)
-    # print("exists table: ", inspect(engine).has_table(table_name))
-
-    # extracted_titles = []
-
-    # if table_name is not None and column_definitions is not None:
-    #     try:
-    #         # Check if the table exists
-    #         if not inspect(engine).has_table(table_name):
-    #             print("TABLE DOESN'T EXIST")
-    #             # If the table doesn't exist, create it
-    #             columns = []
-    #             for col_name, col_type in column_definitions.items():
-    #                 columns.append(Column(col_name, eval(col_type)))
-    #             DynamicModel.__table__ = Table(
-    #                 table_name,
-    #                 Base.metadata,
-    #                 *columns,
-    #             )
-    #             Base.metadata.create_all(engine)
-
-    #         else:
-    #             # print("TITLE LIST:", title_list)
-
-    #             META_DATA = MetaData(bind=engine, reflect=True)
-
-    #             MY_TABLE = META_DATA.tables[table_name]
-
-    #             insert_query = insert(MY_TABLE).values(title_list).on_conflict_do_nothing()
-
-    #             session.execute(insert_query)
-    #             session.commit()
-    #             session.close()
-
-    #         # Create a JSON object with a status message
-    #         response = {'status': 'success'}
-
-    #     except Exception as e:
-    #         print(f"Error inserting data into table: {e}")
-    #         response = {'status': 'error', 'message': str(e)}
-    #         session.rollback()
-
-    # else:
-    #     response = {'status': 'error', 'message': 'Table name or column definitions not provided.'}
-
-    # session.close()
-
-    # return response
-
-
+    elif html_string:
+        send_webhook(b)
+   
 def send_webhook(msg):
     """
     Send a webhook to a specified URL
@@ -284,38 +245,3 @@ if __name__ == '__main__':
     configure_logging()
     app.run('0.0.0.0', 9000)
 
-# @app.route('/results')
-# def get_results():
-#     """
-#     Get the results only if a spider has results
-#     """
-#     global scrape_complete
-#     if scrape_complete:
-#         return json.dumps(quotes_list)
-#     return 'Scrape Still Progress'
-
-# @app.route('/scrape', methods=['POST'])
-# def scrape():
-#     req_data = request.get_json()
-#     url = req_data['url']
-#     parsing_logic = req_data['parsing_logic']
-#     max_pages = req_data['max_pages']
-
-#     configure_logging()
-#     runner = CrawlerRunner(get_project_settings())
-
-#     @defer.inlineCallbacks
-#     def crawl():
-#         yield runner.crawl(MySpider, url=url, parsing_logic=parsing_logic, max_pages=max_pages)
-#         reactor.stop()
-
-
-#     d = crawl()
-#     d.addCallback(process_results)
-#     reactor.run()
-
-#     return 'Scraper started!'
-
-# if __name__ == '__main__':
-#     configure_logging()
-#     app.run()
