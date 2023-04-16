@@ -1,9 +1,14 @@
 import os
 from flask import Flask, request, jsonify, Response
-from sqlalchemy import create_engine, Column, Integer, String, Table
+from sqlalchemy import create_engine, Column, Integer, String, Table, MetaData, inspect
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.dialects.postgresql import insert
 from scrapy.crawler import CrawlerRunner
 from types import MethodType
+import requests
+import config
 import json
 import scrapy
 import psycopg2
@@ -40,6 +45,11 @@ logging.basicConfig(
 )
 
 
+def wait_random():
+    wait_time = random.uniform(5, 10)
+    time.sleep(wait_time)
+
+
 Base = declarative_base()
 
 
@@ -52,53 +62,6 @@ class DynamicModel(Base):
         for col in self.__table__.columns:
             if col.name in kwargs:
                 setattr(self, col.name, kwargs[col.name])
-
-
-@app.route('/model', methods=['POST'])
-def create_dynamic_model():
-    req_data = request.get_json()
-
-    table_name = req_data['table_name']
-    column_definitions = json.loads(req_data['column_definitions'])
-
-    columns = {}
-    for col_name, col_type in column_definitions.items():
-        columns[col_name] = Column(col_name, eval(col_type))
-
-    DynamicModel.__table__ = Table(
-        table_name,
-        Base.metadata,
-        *columns.values(),
-    )
-
-    # Modify the following line to use your PostgreSQL database instead of SQLite
-    engine = create_engine('sqlite:///dynamic_model.db')
-    Base.metadata.create_all(engine)
-
-    return jsonify({
-        'status': 'success',
-        'message': f'Dynamic model {table_name} created successfully'
-    })
-
-
-def wait_random():
-    wait_time = random.uniform(5, 10)
-    time.sleep(wait_time)
-
-
-# def process_results(results):
-#     extracted_texts = []
-#     for result in results:
-#         extracted_text = result.get('text')
-#         if extracted_text:
-#             extracted_texts.append(extracted_text)
-#             print(f"Extracted text: {extracted_text}")
-#             # insert the extracted text into the database
-#             # cur.execute("INSERT INTO mytable (text_column_name) VALUES (%s)", (extracted_text,))
-#             # conn.commit()
-#             # cur.close()
-#             # conn.close()
-#     return extracted_texts
 
 
 class MySpider(scrapy.Spider):
@@ -123,14 +86,16 @@ class MySpider(scrapy.Spider):
         self.log.debug("parse() method called with response: %s", response.url)
         try:
             parsed_data = {}
+            global title_list
             for key, selector in self.parsing_logic.items():
                 extracted_data = response.css(selector).get()
                 self.log.debug(f"Extracted {key}: {extracted_data}")
                 parsed_data[key] = extracted_data
-
-                print("Parsed data: ", parsed_data)
+                title_list.append(parsed_data)
                 print("Selector: ", selector)
+                print("Parsed data: ", parsed_data)
             yield parsed_data
+            print("List: ", title_list)
         except Exception as e:
             self.log.error("Error parsing response: %s", e)
             raise CloseSpider(f"Error parsing response: {e}")
@@ -147,12 +112,15 @@ class MySpider(scrapy.Spider):
             wait_random()
             yield scrapy.Request(next_page, callback=self.parse)
 
+
 crawl_runner = CrawlerRunner()      # requires the Twisted reactor to run
 quotes_list = []                    # store quotes
+title_list = []
 scrape_in_progress = False
 scrape_complete = False
 table_name = None
 column_definitions = None
+
 
 @app.route('/crawl', methods=['POST'])
 def crawl_for_quotes():
@@ -187,6 +155,7 @@ def crawl_for_quotes():
 
     return 'SCRAPE IN PROGRESS'
 
+
 @crochet.run_in_reactor
 def scrape_with_crochet(url, parsing_logic, max_pages, next_button):
     eventual = crawl_runner.crawl(
@@ -205,68 +174,110 @@ def finished_scrape(results):
     scrape_in_progress = False
     global table_name
     global column_definitions
+    global title_list
+
+    a = {
+        "data": title_list
+    }
+
+    if title_list:
+        send_webhook(a)
+    # # Connect to the PostgreSQL database
+    # engine = create_engine('postgresql://postgres:postgres@localhost:5433/postgres')
+    # Session = sessionmaker(bind=engine)
+    # session = Session()
+
+    # print("RESULTS IN CALLBACK: ", results)
+    # print("exists table: ", inspect(engine).has_table(table_name))
+
+    # extracted_titles = []
+
+    # if table_name is not None and column_definitions is not None:
+    #     try:
+    #         # Check if the table exists
+    #         if not inspect(engine).has_table(table_name):
+    #             print("TABLE DOESN'T EXIST")
+    #             # If the table doesn't exist, create it
+    #             columns = []
+    #             for col_name, col_type in column_definitions.items():
+    #                 columns.append(Column(col_name, eval(col_type)))
+    #             DynamicModel.__table__ = Table(
+    #                 table_name,
+    #                 Base.metadata,
+    #                 *columns,
+    #             )
+    #             Base.metadata.create_all(engine)
+
+    #         else:
+    #             # print("TITLE LIST:", title_list)
+
+    #             META_DATA = MetaData(bind=engine, reflect=True)
+
+    #             MY_TABLE = META_DATA.tables[table_name]
+
+    #             insert_query = insert(MY_TABLE).values(title_list).on_conflict_do_nothing()
+
+    #             session.execute(insert_query)
+    #             session.commit()
+    #             session.close()
+
+    #         # Create a JSON object with a status message
+    #         response = {'status': 'success'}
+
+    #     except Exception as e:
+    #         print(f"Error inserting data into table: {e}")
+    #         response = {'status': 'error', 'message': str(e)}
+    #         session.rollback()
+
+    # else:
+    #     response = {'status': 'error', 'message': 'Table name or column definitions not provided.'}
+
+    # session.close()
+
+    # return response
 
 
-    # Connect to the PostgreSQL database
-    # conn = psycopg2.connect(
-    #     database="postgres",
-    #     user="postgres",
-    #     password="postgres",
-    #     host="localhost",
-    #     port="5433"
-    # )
+def send_webhook(msg):
+    """
+    Send a webhook to a specified URL
+    :param msg: task details
+    :return:
+    """
+    print("MSG: ", json.dumps(msg))
 
-    # Open a cursor to perform database operations
-    # cur = conn.cursor()
+    headers = {
+                "Connection": "close",
+               "X-Requested-With": "XMLHttpRequest",
+               "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/536.5 (KHTML, like Gecko) Chrome/19.0.1084.52 Safari/536.5",
+               "Content-Type": "application/json",
+               "Accept": "*/*",
+               }
 
-    print("IN CALLBACK")
-
-    extracted_texts = []
-    response = { 'status': 'no data' }
-
-    if table_name is not None and column_definitions is not None:
-        columns = {}
-        for col_name, col_type in column_definitions.items():
-            columns[col_name] = Column(col_name, eval(col_type))
-
-        DynamicModel.__table__ = Table(
-            table_name,
-            Base.metadata,
-            *columns.values(),
-        )
-
-        engine = create_engine('postgresql://postgres:postgres@localhost:5433/postgres')
-        Base.metadata.create_all(engine)
-
-    if results is not None:
-        try:
-            for result in results:
-                extracted_text = result.get('text')
-                if extracted_text:
-                    extracted_texts.append(extracted_text)
-                    print(f"Extracted text: {extracted_text}")
-                    # Insert the extracted text into the database
-                    # cur.execute("INSERT INTO mytable (text_column_name) VALUES (%s)", (extracted_text,))
-                    # conn.commit()
-
-            # Close the cursor and the database connection
-            # cur.close()
-            # conn.close()
-
-            # Create a JSON object with the extracted texts and a status message
-            response = {'status': 'success', 'extracted_texts': extracted_texts}
-
-        except psycopg2.Error as e:
-            # Rollback the transaction and close the database connection
-            # conn.rollback()
-            # cur.close()
-            # conn.close()
-            print(f"Error inserting data into the database: {e}")
-            # Create a JSON object with an error message
-            response = {'status': 'error', 'message': str(e)}
-
-    # Convert the response object to a JSON string and return it
-    return json.dumps(response)
+    try:
+        # Post a webhook message
+        # default is a function applied to objects that are not serializable = it converts them to str
+        resp = requests.post("http://localhost:8080/scraped",
+                             headers=headers,
+                             data=json.dumps(msg))
+        # Returns an HTTPError if an error has occurred during the process (used for debugging).
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        # print("An HTTP Error occurred",repr(err))
+        pass
+    except requests.exceptions.ConnectionError as err:
+        # print("An Error Connecting to the API occurred", repr(err))
+        pass
+    except requests.exceptions.Timeout as err:
+        # print("A Timeout Error occurred", repr(err))
+        pass
+    except requests.exceptions.RequestException as err:
+        # print("An Unknown Error occurred", repr(err))
+        pass
+    except:
+        pass
+    else:
+        print("RESPONSE: ", {"status": resp.status_code, "body": resp.content})
+        return {"status": resp.status_code, "body": resp.json}
 
 
 if __name__ == '__main__':
