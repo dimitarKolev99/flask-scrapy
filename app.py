@@ -25,6 +25,8 @@ import crochet
 import json
 from flask import Flask
 from scrapy.crawler import CrawlerRunner
+# from pywebcopy import save_webpage
+# from urllib.parse import urlparse
 crochet.setup()     # initialize crochet
 
 app = Flask(__name__)
@@ -37,6 +39,7 @@ scrape_complete = False
 table_name = None
 column_definitions = None
 html_string = None
+
 
 @app.route('/log')
 def log():
@@ -61,11 +64,12 @@ def wait_random():
 class MySpider(scrapy.Spider):
     name = 'myspider'
 
-    def __init__(self, url, parsing_logic, max_pages, next_button, *args, **kwargs):
+    def __init__(self, url, parsing_logic, list_selector, max_pages, next_button, *args, **kwargs):
         super(MySpider, self).__init__(*args, **kwargs)
         self.parsing_logic = parsing_logic
         self.start_urls = [url]
         self.page_count = 1
+        self.list_selector = list_selector
         self.max_pages = max_pages
         self.next_button = next_button
         self.log = logging.getLogger(self.name)
@@ -79,18 +83,25 @@ class MySpider(scrapy.Spider):
     def parse(self, response):
         self.log.debug("parse() method called with response: %s", response.url)
         try:
-            parsed_data = {}
             global title_list
-            if self.parsing_logic is not None:
-                for key, selector in self.parsing_logic.items():
-                    extracted_data = response.css(selector).get()
+            if self.list_selector is not None:
 
-                    self.log.debug(f"Extracted {key}: {extracted_data}")
+                elements = response.css(self.list_selector)
 
-                    parsed_data[key] = extracted_data
-                    title_list.append(parsed_data)
+                for el in elements:
+                    parsed_data = {}
+                    if self.parsing_logic is not None:
+                        for key, selector in self.parsing_logic.items():
+                            extracted_data = el.css(selector).get()
 
-                yield parsed_data
+                            self.log.debug(
+                                f"Extracted {key}: {extracted_data}")
+
+                            parsed_data[key] = extracted_data
+
+                        title_list.append(parsed_data)
+
+                        yield parsed_data
             else:
                 global html_string
                 html_string = response.text
@@ -111,6 +122,7 @@ class MySpider(scrapy.Spider):
             wait_random()
             yield scrapy.Request(next_page, callback=self.parse)
 
+
 @app.route('/html', methods=['POST'])
 def get_html():
     global html_string
@@ -120,15 +132,24 @@ def get_html():
     req_data = request.get_json()
     url = req_data['url']
 
+    # domain_name = urlparse(url).hostname
+    # folder_name = domain_name.replace(".", "_")
+
+    # download_folder = './downloads/'
+
+    # kwargs = {'bypass_robots': True, 'project_name': folder_name}
+
+    # save_webpage(url, download_folder, **kwargs)
+
     if not scrape_in_progress:
         scrape_in_progress = True
         # start the crawler and execute a callback when complete
         scrape_with_crochet(
-            url=url, parsing_logic=None, max_pages=None, next_button=None)
+            url=url, list_selector=None, parsing_logic=None, max_pages=None, next_button=None)
         return 'SCRAPING'
 
     return 'SCRAPE IN PROGRESS'
-
+    # return 'SCRAPING'
 
 
 @app.route('/crawl', methods=['POST'])
@@ -143,6 +164,7 @@ def crawl_for_quotes():
 
     req_data = request.get_json()
     url = req_data['url']
+    list_selector = req_data['list_selector']
     parsing_logic = req_data['parsing_logic']
     max_pages = req_data['max_pages']
     next_button = req_data['next_button']
@@ -158,16 +180,16 @@ def crawl_for_quotes():
         scrape_in_progress = True
         # start the crawler and execute a callback when complete
         scrape_with_crochet(
-            url=url, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
+            url=url, list_selector=list_selector, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
         return 'SCRAPING'
 
     return 'SCRAPE IN PROGRESS'
 
 
 @crochet.run_in_reactor
-def scrape_with_crochet(url, parsing_logic, max_pages, next_button):
+def scrape_with_crochet(url, list_selector, parsing_logic, max_pages, next_button):
     eventual = crawl_runner.crawl(
-        MySpider, url=url, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
+        MySpider, url=url, list_selector=list_selector, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
     eventual.addCallback(finished_scrape)
 
 
@@ -194,33 +216,38 @@ def finished_scrape(results):
     }
 
     if title_list:
-        send_webhook(a)
+        send_webhook(a, None)
     elif html_string:
-        send_webhook(b)
-   
-def send_webhook(msg):
+        send_webhook(b, 'scrapedhtml')
+
+
+def send_webhook(msg, endpoint):
     """
     Send a webhook to a specified URL
     :param msg: task details
     :return:
     """
-    print("MSG: ", json.dumps(msg))
-
     headers = {
-                "Connection": "close",
-               "X-Requested-With": "XMLHttpRequest",
-               "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/536.5 (KHTML, like Gecko) Chrome/19.0.1084.52 Safari/536.5",
-               "Content-Type": "application/json",
-               "Accept": "*/*",
-               }
+        "Connection": "close",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/536.5 (KHTML, like Gecko) Chrome/19.0.1084.52 Safari/536.5",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+    }
 
     try:
         # Post a webhook message
         # default is a function applied to objects that are not serializable = it converts them to str
-        resp = requests.post("http://localhost:8080/scraped",
-                             headers=headers,
-                             data=json.dumps(msg))
-        # Returns an HTTPError if an error has occurred during the process (used for debugging).
+        if endpoint is not None:
+            resp = requests.post(f"http://localhost:8080/{endpoint}",
+                                 headers=headers,
+                                 data=json.dumps(msg))
+        else:
+            resp = requests.post(f"http://localhost:8080/scraped",
+                                 headers=headers,
+                                 data=json.dumps(msg))
+
+            # Returns an HTTPError if an error has occurred during the process (used for debugging).
         resp.raise_for_status()
     except requests.exceptions.HTTPError as err:
         # print("An HTTP Error occurred",repr(err))
@@ -237,11 +264,10 @@ def send_webhook(msg):
     except:
         pass
     else:
-        print("RESPONSE: ", {"status": resp.status_code, "body": resp.content})
+        # print("RESPONSE: ", {"status": resp.status_code, "body": resp.content})
         return {"status": resp.status_code, "body": resp.json}
 
 
 if __name__ == '__main__':
     configure_logging()
     app.run('0.0.0.0', 9000)
-
