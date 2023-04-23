@@ -39,7 +39,15 @@ scrape_complete = False
 table_name = None
 column_definitions = None
 html_string = None
+url_to_scrape = None
 
+app.logger.setLevel(logging.DEBUG)
+
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+app.logger.addHandler(handler)
 
 @app.route('/log')
 def log():
@@ -84,6 +92,8 @@ class MySpider(scrapy.Spider):
         self.log.debug("parse() method called with response: %s", response.url)
         try:
             global title_list
+            global url_to_scrape
+
             if self.list_selector is not None:
 
                 elements = response.css(self.list_selector)
@@ -100,11 +110,16 @@ class MySpider(scrapy.Spider):
                             parsed_data[key] = extracted_data
 
                         title_list.append(parsed_data)
+                        url_to_scrape = self.start_urls
 
                         yield parsed_data
             else:
                 global html_string
                 html_string = response.text
+                url_to_scrape = self.start_urls
+
+                print("Start Url: ", url_to_scrape[0])
+
                 return
         except Exception as e:
             self.log.error("Error parsing response: %s", e)
@@ -125,30 +140,29 @@ class MySpider(scrapy.Spider):
 
 @app.route('/html', methods=['POST'])
 def get_html():
+    logger = logging.getLogger(__name__)    
+
     global html_string
     global scrape_in_progress
     global scrape_complete
 
+    logger.debug("Received a request to scrape HTML")
+
     req_data = request.get_json()
     url = req_data['url']
 
-    # domain_name = urlparse(url).hostname
-    # folder_name = domain_name.replace(".", "_")
-
-    # download_folder = './downloads/'
-
-    # kwargs = {'bypass_robots': True, 'project_name': folder_name}
-
-    # save_webpage(url, download_folder, **kwargs)
+    logger.debug("URL: %s", url)
 
     if not scrape_in_progress:
         scrape_in_progress = True
+        logger.debug("Starting scraper for URL: %s", url)
         # start the crawler and execute a callback when complete
         scrape_with_crochet(
             url=url, list_selector=None, parsing_logic=None, max_pages=None, next_button=None)
-        return 'SCRAPING'
+        return { "response": "SCRAPER STARTED"}
 
-    return 'SCRAPE IN PROGRESS'
+    logger.debug("Scraper already in progress for URL: %s", url)
+    return { "response": "SCRAPE IN PROGRESS"} 
     # return 'SCRAPING'
 
 
@@ -164,15 +178,10 @@ def crawl_for_quotes():
 
     req_data = request.get_json()
     url = req_data['url']
-    list_selector = req_data['list_selector']
-    parsing_logic = req_data['parsing_logic']
-    max_pages = req_data['max_pages']
-    next_button = req_data['next_button']
-    table_name = req_data['table_name']
-    column_definitions = req_data['column_definitions']
-
-    table_name = table_name
-    column_definitions = column_definitions
+    list_selector = req_data['listSelector']
+    parsing_logic = req_data['parsingLogic']
+    max_pages = req_data['maxPages']
+    next_button = req_data['nextButton']
 
     configure_logging()
 
@@ -181,9 +190,9 @@ def crawl_for_quotes():
         # start the crawler and execute a callback when complete
         scrape_with_crochet(
             url=url, list_selector=list_selector, parsing_logic=parsing_logic, max_pages=max_pages, next_button=next_button)
-        return 'SCRAPING'
+        return {"status" "SCRAPING STARTED"}
 
-    return 'SCRAPE IN PROGRESS'
+    return {"status": "SCRAPE IN PROGRESS"}
 
 
 @crochet.run_in_reactor
@@ -202,17 +211,16 @@ def finished_scrape(results):
     scrape_complete = True
     global scrape_in_progress
     scrape_in_progress = False
-    global table_name
-    global column_definitions
     global title_list
     global html_string
+    global url_to_scrape
 
     a = {
-        "data": title_list
+        "data": [title_list, url_to_scrape[0]]
     }
 
     b = {
-        "data": html_string
+        "data": [html_string, url_to_scrape[0]]
     }
 
     if title_list:
@@ -227,6 +235,8 @@ def send_webhook(msg, endpoint):
     :param msg: task details
     :return:
     """
+
+
     headers = {
         "Connection": "close",
         "X-Requested-With": "XMLHttpRequest",
@@ -239,6 +249,9 @@ def send_webhook(msg, endpoint):
         # Post a webhook message
         # default is a function applied to objects that are not serializable = it converts them to str
         if endpoint is not None:
+
+            print("NEW MESSAGE", msg)
+            
             resp = requests.post(f"http://localhost:8080/{endpoint}",
                                  headers=headers,
                                  data=json.dumps(msg))
@@ -269,5 +282,7 @@ def send_webhook(msg, endpoint):
 
 
 if __name__ == '__main__':
-    configure_logging()
-    app.run('0.0.0.0', 9000)
+    # configure_logging()
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    app.run(debug=True, port=9000)
+    # app.run('0.0.0.0', 9000)
